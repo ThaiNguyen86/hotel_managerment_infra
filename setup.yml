@@ -1,0 +1,256 @@
+---
+- name: Setup server with Docker, Jenkins, Java
+  hosts: jenkins
+  become: yes
+  tasks:
+    # ========================
+    # Docker
+    # ========================
+    - name: Update apt
+      apt:
+        update_cache: yes
+
+    - name: Install prerequisites for Docker
+      apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Docker GPG key
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: Add Docker repository
+      shell: |
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+        $(. /etc/os-release && echo \"${UBUNTU_CODENAME:-$VERSION_CODENAME}\") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      args:
+        executable: /bin/bash
+
+    - name: Update apt after Docker repo added
+      apt:
+        update_cache: yes
+
+    - name: Install Docker engine
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    # ========================
+    # Jenkins
+    # ========================
+    - name: Download Jenkins GPG key
+      get_url:
+        url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+        dest: /etc/apt/keyrings/jenkins-keyring.asc
+        mode: '0644'
+
+    - name: Add Jenkins repository
+      copy:
+        dest: /etc/apt/sources.list.d/jenkins.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/
+
+    - name: Update apt after Jenkins repo added
+      apt:
+        update_cache: yes
+
+    - name: Install Jenkins
+      apt:
+        name: jenkins
+        state: present
+
+    - name: Add jenkins user to docker group
+      user:
+        name: jenkins
+        groups: docker
+        append: yes
+
+    # ========================
+    # Java
+    # ========================
+    - name: Install Java (OpenJDK 21)
+      apt:
+        name:
+          - fontconfig
+          - openjdk-21-jre
+        state: present
+
+    # ========================
+    # Restart Jenkins
+    # ========================
+    - name: Restart Jenkins service
+      systemd:
+        name: jenkins
+        state: restarted
+        enabled: yes
+
+- name: Setup Nginx & deploy app with SSL
+  hosts: nginx
+  become: yes
+  vars:
+    backend_domain: hotel-app-be-thanhthai.project3cloudinus.shop
+    frontend_domain: hotel-app-thanhthai.project3cloudinus.shop
+    webroot: /var/www/certbot
+  tasks:
+    - name: Update apt
+      apt:
+        update_cache: yes
+
+    - name: Install Nginx, Certbot, and dependencies
+      apt:
+        name:
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+        state: present
+
+    - name: Create webroot directory for certbot
+      file:
+        path: "{{ webroot }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: 0755
+
+    #####################################
+    # Step 1: HTTP-only Nginx config
+    #####################################
+    - name: Create HTTP-only backend config
+      copy:
+        dest: /etc/nginx/sites-available/hotel-app-be
+        content: |
+          server {
+              listen 80;
+              server_name {{ backend_domain }};
+              location /.well-known/acme-challenge/ {
+                  root {{ webroot }};
+              }
+              location / {
+                  proxy_pass http://{{ hostvars[groups['jenkins'][0]].inventory_hostname }}:3002/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Create HTTP-only frontend config
+      copy:
+        dest: /etc/nginx/sites-available/hotel-app
+        content: |
+          server {
+              listen 80;
+              server_name {{ frontend_domain }};
+              location /.well-known/acme-challenge/ {
+                  root {{ webroot }};
+              }
+              location / {
+                  proxy_pass http://{{ hostvars[groups['jenkins'][0]].inventory_hostname }}:3001/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Enable sites
+      file:
+        src: "/etc/nginx/sites-available/{{ item }}"
+        dest: "/etc/nginx/sites-enabled/{{ item }}"
+        state: link
+      loop:
+        - hotel-app-be
+        - hotel-app
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    #####################################
+    # Step 2: Obtain SSL certificates
+    #####################################
+    - name: Obtain SSL cert for backend
+      shell: |
+        certbot certonly --webroot -w {{ webroot }} -d {{ backend_domain }} --non-interactive --agree-tos -m ngtthai0604@gmail.com --quiet
+
+    - name: Obtain SSL cert for frontend
+      shell: |
+        certbot certonly --webroot -w {{ webroot }} -d {{ frontend_domain }} --non-interactive --agree-tos -m ngtthai0604@gmail.com --quiet
+
+    #####################################
+    # Step 3: Update Nginx for HTTPS
+    #####################################
+    - name: Create HTTPS backend config
+      copy:
+        dest: /etc/nginx/sites-available/hotel-app-be
+        content: |
+          server {
+              listen 80;
+              server_name {{ backend_domain }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name {{ backend_domain }};
+
+              ssl_certificate /etc/letsencrypt/live/{{ backend_domain }}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/{{ backend_domain }}/privkey.pem;
+
+              location / {
+                  proxy_pass http://{{ hostvars[groups['jenkins'][0]].inventory_hostname }}:3002/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Create HTTPS frontend config
+      copy:
+        dest: /etc/nginx/sites-available/hotel-app
+        content: |
+          server {
+              listen 80;
+              server_name {{ frontend_domain }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name {{ frontend_domain }};
+
+              ssl_certificate /etc/letsencrypt/live/{{ frontend_domain }}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/{{ frontend_domain }}/privkey.pem;
+
+              location / {
+                  proxy_pass http://{{ hostvars[groups['jenkins'][0]].inventory_hostname }}:3001/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+        enabled: yes
+
